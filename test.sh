@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH -q debug
 #SBATCH -A m3792
-#SBATCH -t 00:10:00
+#SBATCH -t 00:01:00
 #SBATCH -C cpu
 #SBATCH -J server
 #SBATCH -o server.out

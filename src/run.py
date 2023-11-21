@@ -3,12 +3,13 @@ import json
 import typer
 from typing import Optional
 from sfapi_client.jobs import JobCommand, Job, JobSqueue
-from sfapi_client.compute import Machine
+from sfapi_client.compute import Machine, Compute
 from sfapi_client import Client
 import time
 from fabric import Connection
 import logging
 from pathlib import Path
+from tqdm import tqdm
 
 app = typer.Typer()
 
@@ -36,9 +37,9 @@ def main(
     else:
         logging.basicConfig(encoding="utf-8", level=logging.ERROR)
 
-    client = Client(api_base_url="https://api.nersc.gov/api/v1.2")
+    client = Client()
     compute = client.compute(site)
-    ctx.obj = [client, compute]
+    ctx.obj = compute
 
 
 @app.command()
@@ -46,7 +47,7 @@ def cat(
     ctx: typer.Context,
     path: str = typer.Option(None, "-p", "--path", help="Path at NERSC")
 ):
-    [client, compute] = ctx.obj
+    compute: Compute = ctx.obj
     [ret] = compute.ls(path)
     with ret.open('r') as fl:
         print(fl.read())
@@ -54,20 +55,20 @@ def cat(
 
 @app.command()
 def hostname(ctx: typer.Context):
-    [client, compute] = ctx.obj
+    compute: Compute = ctx.obj
     ret = compute.run("hostname")
     print(ret)
 
 
 @app.command()
 def token(ctx: typer.Context):
-    [client, compute] = ctx.obj
-    print(client.token)
+    compute: Compute = ctx.obj
+    print(compute.client.token)
 
 
 @app.command()
 def status(ctx: typer.Context):
-    [client, compute] = ctx.obj
+    compute: Compute = ctx.obj
     print_json(compute)
 
 
@@ -76,9 +77,9 @@ def ls(
     ctx: typer.Context,
     path: str = typer.Option(None, "-p", "--path", help="Path at NERSC"),
 ):
-    [client, compute] = ctx.obj
+    compute: Compute = ctx.obj
     if path is None:
-        user = client.user()
+        user = compute.client.user()
         path = f"/global/homes/{user.name[0]}/{user.name}/"
     ret = compute.ls(path)
     print_json(ret)
@@ -92,7 +93,7 @@ def jobs(
     command: Optional[JobCommand] = typer.Option(
         "squeue", "-c", help="Command used to get job info"),
 ):
-    [client, compute] = ctx.obj
+    compute: Compute = ctx.obj
     ret = compute.jobs(user=user, command=command)
     print_json(ret)
 
@@ -106,7 +107,7 @@ def job(
         "sacct", "-c", help="Command used to get job info"
     ),
 ):
-    [client, compute] = ctx.obj
+    compute: Compute = ctx.obj
     ret = compute.job(jobid=jobid, command=command)
     print_json(ret)
 
@@ -114,27 +115,30 @@ def job(
 @app.command("submit")
 def submit_job(
     ctx: typer.Context,
-    path: str = typer.Option(
-        ..., "--path", "-p", help="Path to slurm submit file at NERSC"
-    ),
+    file_path: str = typer.Option(
+        ..., "--file", "-f",
+        help="Path to local slurm submit file or path at NERSC"),
+    port_number: int = typer.Option(
+        None, '--port', '-p',
+        help="Port number to open ssh connection to"),
 ):
-    [client, compute] = ctx.obj
-
+    compute: Compute = ctx.obj
     # Read in local path
-    if Path(path).exists():
-        path = Path(path).open('r').read()
+    if Path(file_path).exists():
+        file_path = Path(file_path).open('r').read()
 
     try:
         # Submit the job at the path
-        running_job = compute.submit_job(path)
-        logging.info(f"submitted {running_job.jobid}")
+        running_job = compute.submit_job(file_path)
+        logging.debug(f"submitted {running_job.jobid}")
         # Wait for the job to start running
         running_job.running()
         logging.debug(running_job.nodelist)
     except Exception as err:
         logging.error(f"Error {type(err).__name__}: {err}")
 
-    open_ssh_connection(running_job)
+    if port_number is not None:
+        open_ssh_connection(running_job, port_number)
 
 
 @app.command("scancel")
@@ -142,7 +146,7 @@ def cancel_job(
     ctx: typer.Context,
     jobid: int = typer.Option(..., "--jobid", "-j", help="jobid to cancel"),
 ):
-    [client, compute] = ctx.obj
+    compute: Compute = ctx.obj
     # Get job object
     job = compute.job(jobid=jobid, command=JobCommand.sacct)
     # Cancel job
@@ -150,31 +154,54 @@ def cancel_job(
     print_json(ret)
 
 
-def open_ssh_connection(
-    running_job: JobSqueue
-):
-    first_proxy_jump = Connection('dtn.nersc.gov')
-    proxy_jump = Connection('perlmutter.nersc.gov', gateway=first_proxy_jump)
-    client = Connection(running_job.nodelist, gateway=proxy_jump)
-    # Open the connection to the
-    client.open()
+def time_to_sec(time_limt: str):
+    # Convert slurm time to ints
+    total_time = 0
+    if time_limt is 'INVALID':
+        return total_time
+    if len(time_limt.split("-")) > 1:
+        total_time = 3600 * int(time_limt.split("-")[0])
 
-    with client.forward_local(9000):
-        print("Running tunnel to http://localhost:9000")
-        while client.is_connected:
+    time_limt = time_limt.split("-")[-1]
+
+    for i, t in enumerate(time_limt.split(":")[::-1]):
+        total_time += int(t) * (60**i)
+    return total_time
+
+
+def open_ssh_connection(
+    running_job: JobSqueue,
+    port_number: int
+):
+    proxy_jump = Connection('perlmutter.nersc.gov',
+                            user=running_job.user)
+    ssh_client = Connection(running_job.nodelist,
+                            gateway=proxy_jump,
+                            user=running_job.user)
+    # Open the connection to the node
+    ssh_client.open()
+
+    # Open port back to localhost
+    with ssh_client.forward_local(port_number):
+        print(
+            f"Running tunnel to http://localhost:{port_number}\nTo cancel job ^C\n")
+        # While we're still connected just loop and wait to end
+        while ssh_client.is_connected:
             try:
                 running_job.update()
                 print(running_job.time_left)
-                time.sleep(60)
+                logging.info(
+                    f'Time left {time_to_sec(running_job.time_left)} seconds')
+                time.sleep(10)
             except KeyboardInterrupt:
-                print("\n\nCanceling job with ^C")
+                logging.info("\nCanceling job with ^C")
                 running_job.cancel()
-                print(f"Canceled job {running_job.jobid}")
+                print(f"\nCanceled job {running_job.jobid}")
                 break
 
-    client.close()
+    ssh_client.close()
     running_job.update()
-    print(running_job.state)
+    logging.info(running_job.state)
 
 
 if __name__ == "__main__":
