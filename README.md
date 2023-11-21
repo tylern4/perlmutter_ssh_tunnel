@@ -9,3 +9,5 @@ cd perlmutter_ssh_tunnel
 pip install -r requirements.txt
 python src/run.py submit -f test.sh -p 9000
 ```
+
+To store the sfapi key refer to the [sfapi_client docs](https://nersc.github.io/sfapi_client/quickstart/#setting-up-credentials).

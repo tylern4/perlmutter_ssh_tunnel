@@ -10,6 +10,8 @@ from fabric import Connection
 import logging
 from pathlib import Path
 from tqdm import tqdm
+from authlib.jose import JsonWebKey
+import os
 
 app = typer.Typer()
 
@@ -37,7 +39,16 @@ def main(
     else:
         logging.basicConfig(encoding="utf-8", level=logging.ERROR)
 
-    client = Client()
+    client_id = os.getenv("SFAPI_CLIENT_ID")
+    client_secret = os.getenv("SFAPI_SECRET")
+    if None not in [client_id, client_secret]:
+        # Use explicit environment variables
+        secret = JsonWebKey.import_key(json.loads(client_secret))
+        client = Client(client_id=client_id, secret=secret)
+    else:
+        # Try to get it from a file
+        client = Client()
+    # Use the client to get a compute object
     compute = client.compute(site)
     ctx.obj = compute
 
@@ -157,7 +168,7 @@ def cancel_job(
 def time_to_sec(time_limt: str):
     # Convert slurm time to ints
     total_time = 0
-    if time_limt is 'INVALID':
+    if time_limt == 'INVALID':
         return total_time
     if len(time_limt.split("-")) > 1:
         total_time = 3600 * int(time_limt.split("-")[0])
